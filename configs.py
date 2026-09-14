@@ -5,9 +5,9 @@ configs.py -- центральная конфигурация модели/об�
 Архитектура: DAR-блоки (Delta Attention Residual) из 5 слоёв
 (4x GDN-2 + 1x MLA, соотношение 4:1). MLA использует TPU flash-attention
 ядро (jax.experimental.pallas.ops.tpu.flash_attention, библиотечное, не
-собственное). GDN-2 -- собственная чистая JAX реализация gated delta-rule
-(chunked scan + remat), без внешних Pallas-кернелов -- сознательный выбор
-"с нуля" версии: корректность/простота отладки важнее пиковой скорости.
+собственное). GDN-2 использует собственную Pallas WY-chunked реализацию
+из atomic_ops (gdn2_forward_trainable) -- production kernel library,
+а не reference chunked-scan.
 
 Параметры по умолчанию подобраны под ~250M параметров (см. README.md,
 раздел "как пересчитать под свой бюджет параметров"; count_params()
@@ -34,7 +34,14 @@ class ModelConfig:
     dropout_rate: float = 0.0      # не используется в этой версии (детерминированный forward)
     label_smoothing: float = 0.0
 
-    gdn2_chunk_size: int = 128     # remat-граница scan'а GDN-2 (память/скорость trade-off)
+    gdn2_chunk_size: int = 128     # config.bt для atomic_ops Pallas-кернеля (chunk/scan-граница)
+    gdn2_d_head: int = 128         # ЖЁСТКОЕ требование atomic_ops.configs.validate_inputs:
+                                    # d_head должен быть ровно 128 (MXU tile). Развязан от
+                                    # cfg.d_head (у MLA d_head = d_model // n_heads = 64),
+                                    # иначе gdn2_forward_trainable упадёт с ValueError на TPU.
+                                    # Из-за этого GDN2-проекции (q/k/v/erase/write/out_gate)
+                                    # используют H*gdn2_d_head, а не H*d_head -- параметров
+                                    # у GDN2-слоя станет больше, чем при чистом-JAX варианте.
     rope_theta: float = 10000.0    # только для MLA (GDN-2 не использует RoPE)
 
     tie_embeddings: bool = True
