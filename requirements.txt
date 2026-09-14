@@ -1,0 +1,5 @@
+jax[tpu]>=0.4.30
+flax>=0.8.0
+optax>=0.2.2
+orbax-checkpoint>=0.5.0
+numpy>=1.24
