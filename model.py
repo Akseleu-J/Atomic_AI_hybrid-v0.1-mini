@@ -1,7 +1,10 @@
 """
 model.py -- гибридная GDN-2/MLA модель c Delta Attention Residuals (DAR).
 
-Новый проект (не использует существующий atomic_ops/model.py).
+Новый проект (не использует существующий atomic_ops/model.py как модель
+целиком), НО GDN-2 сублэйер теперь вызывает production Pallas WY-chunked
+кернель из atomic_ops (gdn2_forward_trainable) вместо чистого-JAX
+scan-референса -- см. GDN2Sublayer ниже.
 
 Архитектура:
   - DAR-блок из cfg.layers_per_block слоёв, каждый либо "gdn2", либо "mla".
@@ -15,7 +18,11 @@ model.py -- гибридная GDN-2/MLA модель c Delta Attention Residual
     выбрать, какая предыдущая дельта сейчас релевантна на каждой позиции,
     вместо фиксированного равновесного сложения всех дельт подряд.
   - MLA использует TPU flash-attention (attention.mla_causal_attention).
-  - GDN-2 использует attention.gdn2_chunked_delta_rule (чистый JAX scan).
+  - GDN-2 использует atomic_ops.fallback.gdn2_forward_trainable -- ваш
+    production Pallas WY-chunked forward + custom_vjp backward (B1-B5).
+    Требует d_head==128 (MXU tile, см. atomic_ops/configs.py), поэтому
+    GDN-2 проекции используют cfg.gdn2_d_head, а не cfg.d_head (у MLA
+    d_head = d_model // n_heads, обычно 64 -- эти два числа развязаны).
   - Один SwiGLU FFN на блок (не per-layer, не MoE) -- держит бюджет
     параметров предсказуемым и убирает роутинг из первой версии проекта.
 """
@@ -30,7 +37,9 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from configs import ModelConfig
-from attention import gdn2_chunked_delta_rule, mla_causal_attention
+from attention import mla_causal_attention
+from atomic_ops.fallback import gdn2_forward_trainable
+from atomic_ops.configs import KernelConfig as AtomicKernelConfig
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 
@@ -105,35 +114,63 @@ def apply_rope(x, cos, sin):
 
 
 # ==========================================================================
-# GDN-2 sublayer
+# GDN-2 sublayer -- теперь через atomic_ops Pallas WY-chunked кернель
+# (gdn2_forward_trainable), а не чистый-JAX attention.gdn2_chunked_delta_rule.
 # ==========================================================================
 class GDN2Sublayer(nn.Module):
+    """Использует atomic_ops.fallback.gdn2_forward_trainable -- честный
+    forward+backward custom_vjp Pallas кернель (fused B1-B5 backward),
+    ваш production kernel library, а не reference chunked scan.
+
+    ВАЖНО: atomic_ops жёстко требует d_head==128 (см.
+    atomic_ops/configs.py:validate_inputs -- "Kernels assume d_head=128
+    (MXU tile)"). Поэтому здесь используется cfg.gdn2_d_head (=128 по
+    умолчанию), НЕ cfg.d_head (который зависит от d_model/n_heads и у
+    MLA-слоёв обычно 64). GDN2-проекции q/k/v/erase/write/out_gate имеют
+    размер H*gdn2_d_head, а не H*d_head -- параметров у этого сублэйера
+    больше, чем было бы при "естественном" d_head.
+
+    Naming note (atomic_ops convention, см. reference.py):
+      w = write-gate  (умножает v:      v_new = w*v - erase)
+      b = erase-gate  (умножает k:      erase = (b*k) @ h)
+    Это НЕ то же самое, что write/erase в исходном чистом-JAX варианте
+    по порядку аргументов -- gdn2_forward_trainable(q, k, v, w, b, g, ...),
+    поэтому write_w передаётся четвёртым позиционным, erase_b -- пятым.
+    """
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, x):
         cfg = self.cfg
         b, l, d = x.shape
-        H, D = cfg.n_heads, cfg.d_head
+        H = cfg.n_heads
+        D = cfg.gdn2_d_head          # ЖЁСТКО 128 -- требование atomic_ops
+        proj_dim = H * D
         eps = 1e-6
 
+        assert l % cfg.gdn2_chunk_size == 0, (
+            f"seq_len={l} must be divisible by gdn2_chunk_size={cfg.gdn2_chunk_size} "
+            f"(это становится config.bt для Pallas-кернеля)."
+        )
+
         def short_conv(name, u):
-            w = self.param(f"{name}_conv_w", nn.initializers.normal(0.02), (d, cfg.d_conv))
-            bconv = self.param(f"{name}_conv_b", nn.initializers.zeros, (d,))
+            dim = u.shape[-1]
+            w = self.param(f"{name}_conv_w", nn.initializers.normal(0.02), (dim, cfg.d_conv))
+            bconv = self.param(f"{name}_conv_b", nn.initializers.zeros, (dim,))
             rhs = w.T[:, None, :].astype(u.dtype)
             out = jax.lax.conv_general_dilated(
                 u, rhs, window_strides=(1,), padding=[(cfg.d_conv - 1, 0)],
-                feature_group_count=d, dimension_numbers=("NHC", "HIO", "NHC"),
+                feature_group_count=dim, dimension_numbers=("NHC", "HIO", "NHC"),
             )
             return out + bconv[None, None, :].astype(u.dtype)
 
-        q_lin = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="q_proj")(x)
-        k_lin = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="k_proj")(x)
-        v_lin = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="v_proj")(x)
+        q_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="q_proj")(x)
+        k_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="k_proj")(x)
+        v_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="v_proj")(x)
 
-        q = jax.nn.silu(short_conv("q", q_lin)).reshape(b, l, H, D)
-        k = jax.nn.silu(short_conv("k", k_lin)).reshape(b, l, H, D)
-        v = jax.nn.silu(short_conv("v", v_lin)).reshape(b, l, H, D)
+        q = jax.nn.silu(short_conv("q", q_lin)).reshape(b, l, H, D).astype(jnp.float32)
+        k = jax.nn.silu(short_conv("k", k_lin)).reshape(b, l, H, D).astype(jnp.float32)
+        v = jax.nn.silu(short_conv("v", v_lin)).reshape(b, l, H, D).astype(jnp.float32)
         v = jnp.clip(v, -50.0, 50.0)
 
         def l2norm(t):
@@ -142,42 +179,59 @@ class GDN2Sublayer(nn.Module):
         q = make_grad_sanitizer("gdn2_q_norm")(l2norm(q))
         k = make_grad_sanitizer("gdn2_k_norm")(l2norm(k))
 
-        erase = jax.nn.sigmoid(
-            nn.Dense(d, use_bias=True, dtype=jnp.bfloat16, name="erase_gate")(x)
-        ).reshape(b, l, H, D)
-        write = jax.nn.sigmoid(
-            nn.Dense(d, use_bias=True, dtype=jnp.bfloat16, name="write_gate")(x)
-        ).reshape(b, l, H, D)
+        # atomic_ops naming: w=write-gate (умножает v), b=erase-gate
+        # (умножает k при erase-члене) -- см. reference.py:
+        # bk_t = b_t*k_t (erase), v_new = w_t*v_t - erase.
+        erase_b = jax.nn.sigmoid(
+            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16, name="erase_gate")(x)
+        ).reshape(b, l, H, D).astype(jnp.float32)
+        write_w = jax.nn.sigmoid(
+            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16, name="write_gate")(x)
+        ).reshape(b, l, H, D).astype(jnp.float32)
 
         decay_a = self.param("decay_a", nn.initializers.zeros, (H,)).astype(jnp.float32)
         decay_f = nn.Dense(H, use_bias=True, dtype=jnp.bfloat16, name="decay_proj")(x).astype(jnp.float32)
-        log_decay = -jnp.exp(jnp.clip(decay_a, -20.0, 20.0))[None, None, :] * jax.nn.softplus(decay_f)
-        log_decay = jnp.nan_to_num(log_decay, nan=0.0, posinf=0.0, neginf=-20.0)
+        log_decay_h = -jnp.exp(jnp.clip(decay_a, -20.0, 20.0))[None, None, :] * jax.nn.softplus(decay_f)
+        log_decay_h = jnp.nan_to_num(log_decay_h, nan=0.0, posinf=0.0, neginf=-20.0)
+
+        # atomic_ops ожидает g формы (bsz, L, H, D) -- по-элементно на
+        # каждый d_head, а не один скаляр на голову. Бродкастим одно и
+        # то же значение по всем 128 dim'ам, сохраняя прежнюю семантику
+        # "decay зависит только от головы, не от позиции внутри d_head".
+        log_decay = jnp.broadcast_to(log_decay_h[..., None], (b, l, H, D))
 
         out_gate = jnp.clip(
-            nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="out_gate")(x), -1e2, 1e2
+            nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="out_gate")(x), -1e2, 1e2
         )
 
-        q, k, v, erase, write = map(_sanitize, (q, k, v, erase, write))
+        q, k, v, erase_b, write_w, log_decay = map(
+            _sanitize, (q, k, v, erase_b, write_w, log_decay)
+        )
+
+        bc = cfg.gdn2_chunk_size // 2
+        mb = 16 if bc % 16 == 0 else bc
+        kernel_config = AtomicKernelConfig(
+            bt=cfg.gdn2_chunk_size, bc=bc, mb=mb, wy_eps=1e-3,
+        )
 
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
-        _fwd = partial(gdn2_chunked_delta_rule, chunk_size=cfg.gdn2_chunk_size)
+        # gdn2_forward_trainable(q, k, v, w, b, g, scale, h0=None, config=...)
+        _fwd = partial(gdn2_forward_trainable, scale=1.0, config=kernel_config)
 
         if mesh is not None:
             spec4 = P(batch_axis, None, None, None)
-            spec3 = P(batch_axis, None, None)
             sharded = jax.shard_map(
                 _fwd, mesh=mesh,
-                in_specs=(spec4, spec4, spec4, spec4, spec4, spec3),
-                out_specs=(spec4, P(batch_axis, None, None, None)),
+                in_specs=(spec4, spec4, spec4, spec4, spec4, spec4),
+                out_specs=(spec4, spec4),
                 check_vma=False,
             )
-            out, _h_final = sharded(q, k, v, erase, write, log_decay)
+            out, _h_final = sharded(q, k, v, write_w, erase_b, log_decay)
         else:
-            out, _h_final = _fwd(q, k, v, erase, write, log_decay)
+            out, _h_final = _fwd(q, k, v, write_w, erase_b, log_decay)
 
-        out = out.reshape(b, l, d)
+        out = out.reshape(b, l, proj_dim)
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
         return nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="out_proj")(
             out * jax.nn.silu(out_gate)
