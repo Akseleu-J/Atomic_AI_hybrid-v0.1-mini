@@ -325,7 +325,7 @@ class DARLayer(nn.Module):
         normed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(current_x)
 
         if self.layer_type == "gdn2":
-            delta = GDN2Sublayer(cfg=self.cfg, name="sublayer")(normed)
+            delta = nn.remat(GDN2Sublayer)(cfg=self.cfg, name="sublayer")(normed)
         elif self.layer_type == "mla":
             delta = MLASublayer(cfg=self.cfg, name="sublayer")(normed, cos, sin)
         else:
