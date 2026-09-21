@@ -1,31 +1,16 @@
 """
-model.py -- гибридная GDN-2/MLA модель c Delta Attention Residuals (DAR).
+model.py -- гибридная GDN-2/MLA модель БЕЗ Delta Attention Residuals (DAR).
 
-Правки vs baseline (см. docstring ниже про архитектуру):
+Упрощённая версия: классические residual-связки `x = x + sublayer(norm(x))`.
+DAR механизм (retrieval-attention поверх накопленных дельт) удалён —
+это снимает ~20% времени шага и значительный объём активаций в HBM.
 
-  FIX 1: убран nn.remat(GDN2Sublayer) в DARLayer.
-         Внешний nn.remat(DARBlock) уже делает recompute; вложенный remat
-         давал 3 прохода GDN2 в backward вместо 2 (это видно в [DIAG] n=...,
-         который растёт 12000 вместо 8000 на 50 шагов). Убрали вложенный,
-         получили 2 прохода при той же памяти.
-
-  FIX 2: убраны make_grad_sanitizer вокруг l2norm(q/k) в GDN2Sublayer.
-         q и k там -- unit-векторы, nan_to_num/clip градиента избыточен.
-
-  FIX 3: убран make_grad_sanitizer вокруг delta в DARLayer.
-         Он стоял ДО _sanitize(delta), а _sanitize сам режет градиент на
-         boundary через clip + nan_to_num. Т.е. sanitizer физически не
-         видел градиента -- чистая работа впустую.
-
-  FIX 4: убран make_grad_sanitizer вокруг attn_out в MLASublayer.
-         RMSNorm перед ним стабилизирует выход; градиент редкий случай.
-
-  Оставлен только embed_input sanitizer -- он нужен, потому что tied
-  embeddings (одна матрица используется и на входе, и на выходе) --
-  один плохой токен отравил бы параметр для всех токенов.
-
-  DAR механизм НЕ тронут: stack -> q_proj -> k_proj -> softmax(axis=0) ->
-  weighted sum -> add. Все формулы идентичны baseline.
+Остальное:
+  - GDN-2 через atomic_ops.fallback.gdn2_forward_trainable (shim подменяет
+    на atomic_gdn2 если активен).
+  - MLA через TPU flash-attention.
+  - Один SwiGLU FFN на блок из cfg.layers_per_block слоёв.
+  - Ремat применяется к целому блоку для контроля памяти.
 """
 from __future__ import annotations
 
@@ -67,9 +52,8 @@ def _sanitize(x, clip=1e3):
 
 
 def make_grad_sanitizer(clip_val: float = 1e3):
-    """custom_vjp: identity в forward, чинит (clip + nan_to_num) non-finite
-    градиент в backward. Используется только на embed_input, где он
-    оправдан из-за tied embeddings."""
+    """custom_vjp: identity в forward, clip + nan_to_num в backward.
+    Используется ТОЛЬКО на embed_input (tied embeddings)."""
     @jax.custom_vjp
     def _fn(x):
         return x
@@ -89,7 +73,7 @@ def make_grad_sanitizer(clip_val: float = 1e3):
 
 
 # ==========================================================================
-# RoPE (используется только MLA -- GDN-2 кодирует позицию через decay)
+# RoPE (только для MLA)
 # ==========================================================================
 class RoPE(nn.Module):
     dim: int
@@ -114,18 +98,9 @@ def apply_rope(x, cos, sin):
 
 
 # ==========================================================================
-# GDN-2 sublayer -- atomic_ops Pallas WY-chunked кернель (с shim, если
-# на этапе тренировки подменён на atomic_gdn2)
+# GDN-2 sublayer (atomic_ops Pallas kernel + shim на atomic_gdn2)
 # ==========================================================================
 class GDN2Sublayer(nn.Module):
-    """
-    d_head == 128 (MXU tile, требование atomic_ops) -- используется
-    cfg.gdn2_d_head, а не cfg.d_head.
-
-    Naming (atomic_ops convention):
-      w = write-gate  (умножает v:  v_new = w*v - erase)
-      b = erase-gate  (умножает k:  erase = (b*k) @ h)
-    """
     cfg: ModelConfig
 
     @nn.compact
@@ -153,12 +128,9 @@ class GDN2Sublayer(nn.Module):
             )
             return out + bconv[None, None, :].astype(u.dtype)
 
-        q_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16,
-                         name="q_proj")(x)
-        k_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16,
-                         name="k_proj")(x)
-        v_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16,
-                         name="v_proj")(x)
+        q_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="q_proj")(x)
+        k_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="k_proj")(x)
+        v_lin = nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="v_proj")(x)
 
         q = jax.nn.silu(short_conv("q", q_lin)).reshape(b, l, H, D).astype(jnp.float32)
         k = jax.nn.silu(short_conv("k", k_lin)).reshape(b, l, H, D).astype(jnp.float32)
@@ -168,18 +140,14 @@ class GDN2Sublayer(nn.Module):
         def l2norm(t):
             return t * jax.lax.rsqrt(jnp.sum(t * t, axis=-1, keepdims=True) + eps ** 2)
 
-        # FIX 2: убраны make_grad_sanitizer вокруг l2norm(q) и l2norm(k) --
-        # q,k unit-векторы, nan_to_num избыточен.
         q = l2norm(q)
         k = l2norm(k)
 
         erase_b = jax.nn.sigmoid(
-            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16,
-                     name="erase_gate")(x)
+            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16, name="erase_gate")(x)
         ).reshape(b, l, H, D).astype(jnp.float32)
         write_w = jax.nn.sigmoid(
-            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16,
-                     name="write_gate")(x)
+            nn.Dense(proj_dim, use_bias=True, dtype=jnp.bfloat16, name="write_gate")(x)
         ).reshape(b, l, H, D).astype(jnp.float32)
 
         decay_a = self.param("decay_a", nn.initializers.zeros, (H,)).astype(jnp.float32)
@@ -191,8 +159,8 @@ class GDN2Sublayer(nn.Module):
         log_decay = jnp.broadcast_to(log_decay_h[..., None], (b, l, H, D))
 
         out_gate = jnp.clip(
-            nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16,
-                     name="out_gate")(x), -1e2, 1e2
+            nn.Dense(proj_dim, use_bias=False, dtype=jnp.bfloat16, name="out_gate")(x),
+            -1e2, 1e2,
         )
 
         q, k, v, erase_b, write_w, log_decay = map(
@@ -243,8 +211,7 @@ class MLASublayer(nn.Module):
         Q = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="W_q")(x)
         Q = Q.reshape(b, l, H, D).transpose(0, 2, 1, 3)
 
-        kv = nn.Dense(cfg.d_latent, use_bias=False, dtype=jnp.bfloat16,
-                      name="W_kv_down")(x)
+        kv = nn.Dense(cfg.d_latent, use_bias=False, dtype=jnp.bfloat16, name="W_kv_down")(x)
         K = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="W_k_up")(kv)
         V = nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="W_v_up")(kv)
         K = K.reshape(b, l, H, D).transpose(0, 2, 1, 3)
@@ -260,91 +227,34 @@ class MLASublayer(nn.Module):
                                     batch_axis=get_batch_axis())
         out = out.transpose(0, 2, 1, 3).reshape(b, l, d).astype(x.dtype)
         out = nn.RMSNorm(epsilon=1e-6, name="attn_out_norm")(out).astype(x.dtype)
-        # FIX 4: убран make_grad_sanitizer("mla_attn_out") -- RMSNorm выше
-        # уже стабилизировал выход.
         return nn.Dense(d, use_bias=False, dtype=jnp.bfloat16, name="W_o")(out)
 
 
 # ==========================================================================
-# Delta Attention Residual (DAR) -- retrieval-attention поверх дельт
+# Один слой (residual + sublayer)
 # ==========================================================================
-class DeltaAttentionResidual(nn.Module):
-    """
-    МЕХАНИЗМ НЕ ТРОНУТ:
-      sources (history_blocks из прошлых блоков + local_deltas текущего)
-      -> stack по оси "источник"
-      -> q_proj для current_x, k_proj для stack
-      -> scores = q @ k^T (по d_latent) * scale
-      -> softmax по оси источников (axis=0)
-      -> retrieved = weighted sum of stack
-      -> возвращается для add к current_x
-
-    Каждый слой выбирает, какая предыдущая дельта релевантна на каждой
-    позиции -- заменяет наивное `x = x + sum(deltas)`.
-    """
-    cfg: ModelConfig
-
-    @nn.compact
-    def __call__(self, current_x, sources):
-        n = len(sources)
-        if n == 0:
-            return jnp.zeros_like(current_x)
-        if n == 1:
-            return sources[0].astype(current_x.dtype)
-
-        b, l, d = current_x.shape
-        stack = jnp.stack(sources, axis=0)              # (n, b, l, d)
-
-        q = nn.Dense(self.cfg.d_latent, use_bias=False,
-                     dtype=jnp.bfloat16, name="q_proj")(current_x)
-        flat = stack.reshape(n * b * l, d)
-        k_flat = nn.Dense(self.cfg.d_latent, use_bias=False,
-                          dtype=jnp.bfloat16, name="k_proj")(flat)
-        k = k_flat.reshape(n, b, l, self.cfg.d_latent)
-
-        scale = 1.0 / math.sqrt(self.cfg.d_latent)
-        scores = jnp.einsum("bld,nbld->nbl", q, k, precision=_HIGHEST) * scale
-        weights = jax.nn.softmax(scores, axis=0)
-        retrieved = jnp.einsum("nbl,nbld->bld", weights, stack, precision=_HIGHEST)
-        return retrieved.astype(current_x.dtype)
-
-
-# ==========================================================================
-# Один слой DAR-блока
-# ==========================================================================
-class DARLayer(nn.Module):
+class Layer(nn.Module):
     cfg: ModelConfig
     layer_type: str
     layer_idx: int
 
     @nn.compact
-    def __call__(self, current_x, local_deltas, history_blocks, cos, sin):
-        dar_sources = ([history_blocks[j] for j in range(history_blocks.shape[0])]
-                       + list(local_deltas))
-        retrieved = DeltaAttentionResidual(cfg=self.cfg, name="dar")(
-            current_x, dar_sources)
-        current_x = current_x + retrieved
-
-        normed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(current_x)
+    def __call__(self, x, cos, sin):
+        normed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(x)
 
         if self.layer_type == "gdn2":
-            # FIX 1: было nn.remat(GDN2Sublayer)(...) -- убрали вложенный
-            # remat. Внешний nn.remat(DARBlock) уже recompute'ит всё
-            # целиком, и вложенный remat давал лишний (третий) проход.
             delta = GDN2Sublayer(cfg=self.cfg, name="sublayer")(normed)
         elif self.layer_type == "mla":
             delta = MLASublayer(cfg=self.cfg, name="sublayer")(normed, cos, sin)
         else:
             raise ValueError(f"Unknown layer_type={self.layer_type!r}")
 
-        # FIX 3: убран make_grad_sanitizer вокруг delta -- он стоял ДО
-        # _sanitize, а _sanitize сам режет градиент на boundary.
         delta = _sanitize(delta)
-        return current_x, delta
+        return _sanitize(x + delta)
 
 
 # ==========================================================================
-# SwiGLU FFN (один на блок)
+# SwiGLU FFN
 # ==========================================================================
 class BlockFFN(nn.Module):
     cfg: ModelConfig
@@ -361,34 +271,26 @@ class BlockFFN(nn.Module):
 
 
 # ==========================================================================
-# DAR-блок
+# Блок: несколько слоёв + один FFN в конце
 # ==========================================================================
-class DARBlock(nn.Module):
+class Block(nn.Module):
     cfg: ModelConfig
     block_idx: int
     layer_idx_start: int
 
     @nn.compact
-    def __call__(self, current_x, history_blocks, cos, sin):
-        local_deltas = []
+    def __call__(self, x, cos, sin):
         for i in range(self.cfg.layers_per_block):
             layer_idx = self.layer_idx_start + i
             layer_type = self.cfg.layer_types[layer_idx]
-            current_x, delta = DARLayer(
+            x = Layer(
                 cfg=self.cfg, layer_type=layer_type, layer_idx=layer_idx,
                 name=f"layer_{layer_idx}",
-            )(current_x, local_deltas, history_blocks, cos, sin)
-            local_deltas.append(delta)
-            current_x = _sanitize(current_x)
+            )(x, cos, sin)
 
-        block_delta = sum(local_deltas)
-        new_history = jnp.concatenate(
-            [history_blocks, block_delta[None, ...]], axis=0)
-
-        normed = nn.RMSNorm(epsilon=1e-6, name="pre_ffn_norm")(current_x)
+        normed = nn.RMSNorm(epsilon=1e-6, name="pre_ffn_norm")(x)
         ffn_out = BlockFFN(cfg=self.cfg, name="ffn")(normed)
-        output = _sanitize(current_x + ffn_out)
-        return output, new_history
+        return _sanitize(x + ffn_out)
 
 
 # ==========================================================================
@@ -408,26 +310,17 @@ class HybridByteLM(nn.Module):
             dtype=jnp.bfloat16, name="embed",
         )
         x = embed(input_ids)
-        # embed_input sanitizer оставлен: tied embeddings -> одна матрица
-        # используется на входе и выходе, любая порча параметра бьёт по
-        # всем токенам.
         x = make_grad_sanitizer(clip_val=1e3)(x)
 
         cos, sin = RoPE(dim=cfg.d_head, theta=cfg.rope_theta)(l)
 
-        history_blocks = jnp.zeros((0, b, l, cfg.d_model), dtype=x.dtype)
-
-        # Outer remat(DARBlock) оставлен -- экономит память на DAR-стеке
-        # и на промежуточных активациях блока. FIX 1 убрал вложенный
-        # remat вокруг GDN2, поэтому число проходов GDN2 = 2 (forward +
-        # recompute для backward), а не 3.
-        RematBlock = nn.remat(DARBlock)
+        RematBlock = nn.remat(Block)
         for block_idx in range(cfg.num_blocks):
             layer_idx_start = block_idx * cfg.layers_per_block
-            x, history_blocks = RematBlock(
+            x = RematBlock(
                 cfg=cfg, block_idx=block_idx, layer_idx_start=layer_idx_start,
                 name=f"block_{block_idx}",
-            )(x, history_blocks, cos, sin)
+            )(x, cos, sin)
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x).astype(x.dtype)
         if return_hidden:
